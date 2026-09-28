@@ -37,6 +37,13 @@ export type Movie = {
     spatialAudio?: boolean;
     audioDescription?: boolean;
     closedCaptions?: boolean;
+    subtitles?: boolean;
+    limitedSeries?: boolean;
+    announcement?: {
+      type: "next-season" | "next-episode" | "final-season";
+      airDate?: string | null;
+      year?: number | null;
+    };
   };
   /** Live TMDB popularity score — used for Top 10 ranking and the
    *  popularity-weighted category shuffle (see lib/badgeUtils.ts). */

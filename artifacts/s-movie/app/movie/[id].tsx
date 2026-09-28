@@ -29,6 +29,7 @@ import YoutubeEmbed from "@/components/YoutubeEmbed";
 import GeminiRecommender from "@/components/GeminiRecommender";
 import MovieAIPanel from "@/components/MovieAIPanel";
 import MovieShareBottomSheet, { type ShareTarget } from "@/components/MovieShareBottomSheet";
+import TitleMetadataRow from "@/components/TitleMetadataRow";
 import { useMyList } from "@/contexts/MyListContext";
 import { findMovie } from "@/data/movies";
 import { haptic } from "@/lib/haptics";
@@ -69,6 +70,11 @@ import {
   saveDetailCache,
   type DetailMediaType,
 } from "@/lib/detailCache";
+import {
+  buildTitleMetadata,
+  formatTitleAnnouncement,
+  getTitleAnnouncement,
+} from "@/lib/titleMetadata";
 
 const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get("window");
 const DETAIL_HERO_HEIGHT = Math.round((SCREEN_W * 9) / 16);
@@ -155,9 +161,8 @@ function buildDynamicMovie(
 ): ReturnType<typeof findMovie> {
   const { detail, type, posterUri, heroUri } = cached;
   const title = detail.title ?? detail.name ?? "Untitled";
-  const year = parseInt(
-    (detail.release_date ?? detail.first_air_date ?? "2024").slice(0, 4),
-  );
+  const yearValue = (detail.release_date ?? detail.first_air_date ?? "").slice(0, 4);
+  const year = /^\d{4}$/.test(yearValue) ? Number(yearValue) : 0;
   const seasons = detail.number_of_seasons ?? 0;
 
   return {
@@ -168,13 +173,13 @@ function buildDynamicMovie(
       : require("@/assets/images/hero.png"),
     hero: heroUri ? { uri: heroUri } : undefined,
     year,
-    rating: "TV-MA",
+    rating: "",
     duration:
       type === "tv"
         ? `${seasons} Season${seasons !== 1 ? "s" : ""}`
         : detail.runtime
           ? `${detail.runtime}m`
-          : "—",
+          : "",
     genres: detail.genres?.map((g) => g.name) ?? [],
     cast: [],
     director: "—",
@@ -183,12 +188,6 @@ function buildDynamicMovie(
     mediaType: type,
     tmdbRating: Math.round((detail.vote_average ?? 0) * 10) / 10,
     tmdbId: detail.id,
-    metadata: {
-      quality: "HD",
-      spatialAudio: true,
-      audioDescription: true,
-      closedCaptions: true,
-    },
   } as any;
 }
 
@@ -480,60 +479,6 @@ export default function MovieDetail() {
     } catch { return false; }
   }, [tmdbDetail]);
 
-  const releaseYear = useMemo(() => {
-    const date = tmdbDetail?.release_date ?? tmdbDetail?.first_air_date;
-    const year = date?.slice(0, 4) ?? String(movie?.year ?? "");
-    return /^\d{4}$/.test(year) ? year : "";
-  }, [tmdbDetail, movie?.year]);
-
-  // Formatted metadata label — runtime for movies, seasons/episode count for TV.
-  const durationLabel = useMemo(() => {
-    if (isTV) {
-      const isLimitedSeries =
-        tmdbDetail?.type?.toLowerCase() === "miniseries" ||
-        /limited[\s-]*series|miniseries/i.test(movie?.duration ?? "");
-      const seasons = tmdbDetail?.number_of_seasons ?? (movie as any)?.seasons ?? 0;
-      if (isLimitedSeries) return "Limited Series";
-      if (seasons > 0) return `${seasons} Season${seasons !== 1 ? "s" : ""}`;
-
-      const detailEpisodeCount = tmdbDetail?.number_of_episodes
-        ?? tmdbDetail?.seasons?.reduce((total, season) => total + (season.episode_count ?? 0), 0)
-        ?? 0;
-      const localEpisodeCount = tmdbEpisodes.length || (movie?.episodes?.length ?? 0);
-      const episodeCount = detailEpisodeCount || localEpisodeCount;
-      return episodeCount > 0
-        ? `${episodeCount} Episode${episodeCount !== 1 ? "s" : ""}`
-        : "";
-    }
-    const mins = tmdbDetail?.runtime ?? 0;
-    if (mins >= 60) {
-      const hours = Math.floor(mins / 60);
-      const remainingMinutes = mins % 60;
-      return remainingMinutes > 0 ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
-    }
-    if (mins > 0) return `${mins}m`;
-    return movie?.duration ?? "";
-  }, [isTV, tmdbDetail, movie, tmdbEpisodes.length]);
-
-  // Keep the badges below the title data-driven. Local titles can override
-  // them when the catalog knows a capability; TMDB titles receive the same
-  // Netflix-style defaults while their year, rating, and duration stay live.
-  const titleMetadata = useMemo(() => {
-    const metadata = (movie as any)?.metadata as {
-      quality?: string;
-      spatialAudio?: boolean;
-      audioDescription?: boolean;
-      closedCaptions?: boolean;
-    } | undefined;
-
-    return {
-      quality: metadata?.quality ?? "HD",
-      spatialAudio: metadata?.spatialAudio ?? true,
-      audioDescription: metadata?.audioDescription ?? true,
-      closedCaptions: metadata?.closedCaptions ?? true,
-    };
-  }, [movie]);
-
   // Render the catalog certification immediately, then replace it with the
   // regional TMDB value when that request finishes.
   const displayCertification = useMemo(
@@ -541,15 +486,22 @@ export default function MovieDetail() {
     [contentCertification, movie?.rating],
   );
 
+  const titleMetadata = useMemo(
+    () =>
+      buildTitleMetadata({
+        movie,
+        detail: tmdbDetail,
+        isTV,
+        certification: displayCertification,
+        episodeCount: tmdbEpisodes.length || movie?.episodes?.length,
+      }),
+    [displayCertification, isTV, movie, tmdbDetail, tmdbEpisodes.length],
+  );
+
   const highlightStatus = useMemo(() => {
-    const nextEpisodeDate = tmdbDetail?.next_episode_to_air?.air_date;
-    if (isTV && nextEpisodeDate) {
-      const formattedDate = formatEpisodeDate(nextEpisodeDate);
-      return formattedDate ? `New episode coming on ${formattedDate}` : null;
-    }
-    if (isTV && tmdbDetail?.status === "Returning Series") {
-      return "It's official: Another season is coming";
-    }
+    const announcement = getTitleAnnouncement(movie, tmdbDetail, isTV);
+    const formattedAnnouncement = formatTitleAnnouncement(announcement);
+    if (formattedAnnouncement) return formattedAnnouncement;
     if (tmdbDetail?.status === "Post Production") return "Coming soon";
     if (isComingSoon) {
       const date = tmdbDetail?.release_date ?? tmdbDetail?.first_air_date;
@@ -557,7 +509,7 @@ export default function MovieDetail() {
       return formattedDate ? `Coming on ${formattedDate}` : "Coming soon";
     }
     return null;
-  }, [isComingSoon, isTV, tmdbDetail]);
+  }, [isComingSoon, isTV, movie, tmdbDetail]);
 
   // Download action label — mirrors active season + episode selector
   const downloadActionLabel = useMemo(() => {
@@ -1474,42 +1426,7 @@ export default function MovieDetail() {
           {/* Title */}
            <Text style={styles.title}>{movie?.title ?? title_param ?? ""}</Text>
 
-          {/* Netflix-style metadata row — kept on one horizontal line */}
-          <ScrollView
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            style={styles.metaRowScroll}
-            contentContainerStyle={styles.metaRow}
-          >
-            {releaseYear ? <Text style={styles.metaYear}>{releaseYear}</Text> : null}
-            {displayCertification ? (
-              <View style={styles.ratingPill}>
-                <Text style={styles.ratingText}>{displayCertification}</Text>
-              </View>
-            ) : null}
-            {durationLabel ? <Text style={styles.metaDur}>{durationLabel}</Text> : null}
-            {titleMetadata.quality ? (
-              <View style={styles.metaBadge}>
-                <Text style={styles.metaBadgeText}>{titleMetadata.quality}</Text>
-              </View>
-            ) : null}
-            {titleMetadata.spatialAudio ? (
-              <View style={styles.metaAudioBadge} accessibilityLabel="Spatial Audio available">
-                <Ionicons name="radio-outline" size={18} color="#bcbcbc" />
-                <Text style={styles.metaAudioText}>Spatial{"\n"}Audio</Text>
-              </View>
-            ) : null}
-            {titleMetadata.audioDescription ? (
-              <Text style={styles.metaAudioDescription} accessibilityLabel="Audio description available">
-                AD»
-              </Text>
-            ) : null}
-            {titleMetadata.closedCaptions ? (
-              <View style={styles.metaIconBadge} accessibilityLabel="Closed captions available">
-                <Ionicons name="chatbox-ellipses-outline" size={18} color="#bcbcbc" />
-              </View>
-            ) : null}
-          </ScrollView>
+          <TitleMetadataRow data={titleMetadata} />
 
           {highlightStatus ? (
             <Text style={styles.highlightStatus}>{highlightStatus}</Text>
@@ -2264,25 +2181,6 @@ const styles = StyleSheet.create({
     lineHeight: 33,
     marginBottom: 11,
   },
-  metaRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-    paddingRight: 16,
-  },
-  metaRowScroll: {
-    marginBottom: 10,
-  },
-  // New in 2024 Netflix: year is slightly brighter gray
-  metaYear: { color: "#bcbcbc", fontSize: 14, fontFamily: "Inter_500Medium" },
-  metaDur:  { color: "#bcbcbc", fontSize: 14, fontFamily: "Inter_500Medium" },
-  ratingPill: {
-    paddingHorizontal: 6,
-    paddingVertical: 3,
-    backgroundColor: "rgba(128,128,128,0.55)",
-    borderRadius: 2,
-  },
-  ratingText: { color: "#eeeeee", fontSize: 11, fontFamily: "Inter_600SemiBold", letterSpacing: 0.2 },
   imdbBadge: {
     paddingHorizontal: 6,
     paddingVertical: 2,
@@ -2292,38 +2190,6 @@ const styles = StyleSheet.create({
     borderColor: "rgba(245,197,24,0.3)",
   },
   imdbText: { color: "#f5c518", fontSize: 11, fontFamily: "Inter_700Bold" },
-  metaBadge: {
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.30)",
-    borderRadius: 3,
-  },
-  metaBadgeText: { color: "#bcbcbc", fontSize: 10, fontFamily: "Inter_700Bold", letterSpacing: 0.8 },
-  metaAudioBadge: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 3,
-  },
-  metaAudioText: {
-    color: "#bcbcbc",
-    fontSize: 9,
-    lineHeight: 10,
-    fontFamily: "Inter_600SemiBold",
-  },
-  metaAudioDescription: {
-    color: "#bcbcbc",
-    fontSize: 10,
-    fontFamily: "Inter_700Bold",
-    letterSpacing: 0.2,
-  },
-  metaIconBadge: {
-    minWidth: 22,
-    height: 22,
-    paddingHorizontal: 0,
-    alignItems: "center",
-    justifyContent: "center",
-  },
   highlightStatus: {
     color: "#ffffff",
     fontSize: 14,
