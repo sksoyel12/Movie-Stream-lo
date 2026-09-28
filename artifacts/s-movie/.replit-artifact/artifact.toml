@@ -1,0 +1,24 @@
+kind = "mobile"
+previewPath = "/"
+title = "S Movie Original"
+description = "An Expo streaming app for browsing movies and series, discovering originals, managing a watchlist, and playing available content across mobile and web previews."
+version = "1.0.0"
+id = "artifacts/s-movie"
+router = "expo-domain"
+
+[[services]]
+name = "expo"
+ensurePreviewReachable = "/status"
+paths = [ "/" ]
+localPort = 23135
+
+[services.development]
+run = "pnpm --filter @workspace/s-movie run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/s-movie", "run", "build" ]
+run = [ "pnpm", "--filter", "@workspace/s-movie", "run", "serve" ]
+
+[services.env]
+PORT = "23135"
+BASE_PATH = "/"

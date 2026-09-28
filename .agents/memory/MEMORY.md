@@ -1,0 +1,3 @@
+- [Offline playback lookup](offline-playback.md) — resolve completed local downloads from the route ID before relying on the static catalog.
+- [API server runtime recovery](api-server-runtime.md) — rebuild the managed uv environment when a healthy TMDB proxy fails at startup with a missing locked package.
+- [Archive permission checks](archive-permission-checks.md) — imported archives can normalize read-only protected files; restore their mode before running integrity verification.

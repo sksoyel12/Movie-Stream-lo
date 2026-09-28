@@ -1,0 +1,174 @@
+"""Main entry point for seeding the OTT platform database.
+
+Usage:
+    uv run python -m app.seed.run_seeds                # seed catalog, EPG, users
+    uv run python -m app.seed.run_seeds --embeddings   # also generate embeddings
+"""
+
+import argparse
+import asyncio
+import sys
+import time
+
+from sqlalchemy import text
+
+from app.database import async_session_factory, engine
+
+# Ensure all models are imported so SQLAlchemy discovers them
+import app.models  # noqa: F401
+
+
+async def _check_db_connection() -> bool:
+    """Verify the database is reachable."""
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        return True
+    except Exception as e:
+        print(f"  Database connection failed: {e}")
+        return False
+
+
+async def _ensure_tables() -> None:
+    """Create all tables if they do not exist.
+
+    This is a safety fallback. In production, Alembic migrations should be
+    used instead. We import Base here after models have been loaded.
+    """
+    from app.database import Base
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+
+async def main(include_embeddings: bool = False) -> None:
+    """Run all seed functions in order and print a summary."""
+    print("=" * 60)
+    print("  OTT Platform — Database Seeder")
+    print("=" * 60)
+
+    # 1. Check connectivity
+    print("\n[1/6] Checking database connection...")
+    if not await _check_db_connection():
+        print("ERROR: Cannot connect to the database. Check DATABASE_URL.")
+        sys.exit(1)
+    print("  Connected.")
+
+    # 2. Ensure tables exist
+    print("\n[2/6] Ensuring tables exist...")
+    await _ensure_tables()
+    print("  Tables ready.")
+
+    # 3. Seed catalog
+    print("\n[3/6] Seeding catalog (genres, titles, cast, seasons, episodes)...")
+    start = time.monotonic()
+    from app.seed.seed_catalog import seed_catalog
+
+    async with async_session_factory() as session:
+        catalog_counts = await seed_catalog(session)
+    elapsed = time.monotonic() - start
+    print(f"  Done in {elapsed:.1f}s.")
+
+    # 4. Seed EPG
+    print("\n[4/6] Seeding EPG (channels, schedule entries)...")
+    start = time.monotonic()
+    from app.seed.seed_epg import seed_epg
+
+    async with async_session_factory() as session:
+        epg_counts = await seed_epg(session)
+    elapsed = time.monotonic() - start
+    print(f"  Done in {elapsed:.1f}s.")
+
+    # 5. Seed users (depends on catalog + EPG)
+    print("\n[5/6] Seeding users (packages, users, profiles, entitlements)...")
+    start = time.monotonic()
+    from app.seed.seed_users import seed_users
+
+    async with async_session_factory() as session:
+        user_counts = await seed_users(session)
+    elapsed = time.monotonic() - start
+    print(f"  Done in {elapsed:.1f}s.")
+
+    # 6. Seed bookmarks (depends on users + catalog)
+    print("\n[6/7] Seeding bookmarks (continue watching demo data)...")
+    start = time.monotonic()
+    from app.seed.seed_bookmarks import seed_bookmarks
+
+    async with async_session_factory() as session:
+        bookmark_counts = await seed_bookmarks(session)
+    elapsed = time.monotonic() - start
+    print(f"  Done in {elapsed:.1f}s.")
+
+    # 7. Seed entitlements (Feature 012)
+    print("\n[7/8] Seeding entitlements (packages, title offers, test users)...")
+    start = time.monotonic()
+    from app.seed.seed_entitlements import seed_entitlements
+
+    async with async_session_factory() as session:
+        entitlement_counts = await seed_entitlements(session)
+    elapsed = time.monotonic() - start
+    print(f"  Done in {elapsed:.1f}s.")
+
+    # 8. Seed analytics events (Feature 001 — requires users + profiles + titles)
+    print("\n[8/9] Seeding analytics events (500–1000 synthetic events for agent demo)...")
+    start = time.monotonic()
+    from app.seed.seed_analytics import seed_analytics
+
+    async with async_session_factory() as session:
+        analytics_counts = await seed_analytics(session)
+    elapsed = time.monotonic() - start
+    print(f"  Done in {elapsed:.1f}s.")
+
+    # 9. Seed TSTV data (Feature 016 — requires channels from EPG seed)
+    print("\n[9/9] Seeding TSTV data (channel keys, DRM keys)...")
+    start = time.monotonic()
+    from app.seed.seed_tstv import seed_tstv
+
+    async with async_session_factory() as session:
+        tstv_counts = await seed_tstv(session)
+    elapsed = time.monotonic() - start
+    print(f"  Done in {elapsed:.1f}s.")
+
+    # Optional: Embeddings
+    embed_counts: dict[str, int] = {}
+    if include_embeddings:
+        print("\n[+] Generating content embeddings (this may take a minute)...")
+        start = time.monotonic()
+        from app.seed.seed_embeddings import seed_embeddings
+
+        async with async_session_factory() as session:
+            embed_counts = await seed_embeddings(session)
+        elapsed = time.monotonic() - start
+        print(f"  Done in {elapsed:.1f}s.")
+
+    # Summary
+    all_counts = {**catalog_counts, **epg_counts, **user_counts, **bookmark_counts, **entitlement_counts, **analytics_counts, **tstv_counts, **embed_counts}
+    print("\n" + "=" * 60)
+    print("  SEED SUMMARY")
+    print("=" * 60)
+    for key, value in all_counts.items():
+        label = key.replace("_", " ").title()
+        print(f"  {label:<25} {value:>6}")
+    print("=" * 60)
+
+    total = sum(all_counts.values())
+    if total == 0:
+        print("  Database was already seeded. No new records created.")
+    else:
+        print(f"  Total records created: {total}")
+    print()
+
+    # Dispose engine to close all connections
+    await engine.dispose()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Seed the OTT platform database.")
+    parser.add_argument(
+        "--embeddings",
+        action="store_true",
+        help="Also generate content embeddings using sentence-transformers.",
+    )
+    args = parser.parse_args()
+
+    asyncio.run(main(include_embeddings=args.embeddings))
