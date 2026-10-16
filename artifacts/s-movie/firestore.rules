@@ -1,0 +1,139 @@
+// Account and numeric S-Movie ID rule patch.
+// Merge these matches into the project's existing Firestore rules. This file
+// does not include the app's other collection rules, so do not publish it as
+// a replacement for the complete production ruleset.
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return signedIn() && request.auth.token.get('admin', false) == true;
+    }
+
+    function isOwner(userId) {
+      return signedIn() && request.auth.uid == userId;
+    }
+
+    function isNumericSmoId(smoId) {
+      return smoId is string && smoId.matches('^[0-9]{12}$');
+    }
+
+    function ownsSmoIdAssignment(userId, smoId) {
+      let assignmentPath =
+        /databases/$(database)/documents/smoIdAssignments/$(userId);
+      return isNumericSmoId(smoId)
+        && existsAfter(assignmentPath)
+        && getAfter(assignmentPath).data.smoId == smoId;
+    }
+
+    function suspensionFieldsUnchanged() {
+      return request.resource.data.get('status', null)
+          == resource.data.get('status', null)
+        && request.resource.data.get('isSuspended', false)
+          == resource.data.get('isSuspended', false)
+        && request.resource.data.get('banned', false)
+          == resource.data.get('banned', false)
+        && request.resource.data.get('suspensionReason', null)
+          == resource.data.get('suspensionReason', null)
+        && request.resource.data.get('banReason', null)
+          == resource.data.get('banReason', null);
+    }
+
+    match /users/{userId} {
+      allow get: if isAdmin() || isOwner(userId);
+      allow list: if false;
+
+      allow create: if isAdmin() || (
+        isOwner(userId)
+        && isNumericSmoId(request.resource.data.get('smoId', null))
+        && request.resource.data.get('status', null) == 'active'
+        && request.resource.data.get('isSuspended', false) == false
+        && request.resource.data.get('banned', false) == false
+        && request.resource.data.get('suspensionReason', null) == null
+        && request.resource.data.get('banReason', null) == null
+        && ownsSmoIdAssignment(
+          userId,
+          request.resource.data.get('smoId', null)
+        )
+      );
+
+      allow update: if isAdmin() || (
+        isOwner(userId)
+        && isNumericSmoId(request.resource.data.get('smoId', null))
+        && ownsSmoIdAssignment(
+          userId,
+          request.resource.data.get('smoId', null)
+        )
+        && (
+          !isNumericSmoId(resource.data.get('smoId', null))
+          || resource.data.get('smoId', null)
+            == request.resource.data.get('smoId', null)
+          || !ownsSmoIdAssignment(
+            userId,
+            resource.data.get('smoId', null)
+          )
+        )
+        && (
+          request.resource.data.get('status', null)
+            == resource.data.get('status', null)
+          || (
+            resource.data.get('status', null) == null
+            && request.resource.data.get('status', null) == 'active'
+          )
+        )
+        && suspensionFieldsUnchanged()
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    match /smoIdAssignments/{userId} {
+      allow get: if isAdmin() || isOwner(userId);
+      allow list: if false;
+
+      allow create: if isOwner(userId)
+        && request.resource.data.keys().hasOnly(['smoId'])
+        && isNumericSmoId(request.resource.data.get('smoId', null))
+        && existsAfter(
+          /databases/$(database)/documents/smoIdRegistry/$(request.resource.data.smoId)
+        )
+        && getAfter(
+          /databases/$(database)/documents/smoIdRegistry/$(request.resource.data.smoId)
+        ).data.claimed == true;
+
+      allow update: if isAdmin() || (
+        isOwner(userId)
+        && request.resource.data.keys().hasOnly(['smoId'])
+        && isNumericSmoId(request.resource.data.get('smoId', null))
+        && (
+          !isNumericSmoId(resource.data.get('smoId', null))
+          || request.resource.data.get('smoId', null)
+            == resource.data.get('smoId', null)
+        )
+        && existsAfter(
+          /databases/$(database)/documents/smoIdRegistry/$(request.resource.data.smoId)
+        )
+        && getAfter(
+          /databases/$(database)/documents/smoIdRegistry/$(request.resource.data.smoId)
+        ).data.claimed == true
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    match /smoIdRegistry/{numericId} {
+      allow get: if signedIn();
+      allow list: if false;
+
+      allow create: if signedIn()
+        && numericId.matches('^[0-9]{12}$')
+        && request.resource.data.keys().hasOnly(['claimed', 'createdAt'])
+        && request.resource.data.claimed == true;
+
+      allow update, delete: if isAdmin();
+    }
+  }
+}
