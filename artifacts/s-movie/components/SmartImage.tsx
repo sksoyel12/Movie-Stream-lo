@@ -4,11 +4,12 @@
  * Problem: image.tmdb.org is DNS-blocked on Indian ISPs (BSNL, Airtel, Jio).
  *
  * Retry chain for TMDB artwork:
- *   1. /api/image      ← Replit server proxy with the complete encoded TMDB URL
- *   2. wsrv.nl         ← image proxy fallback for restricted mobile networks
- *   3. image.tmdb.org  ← direct CDN fallback
+ *   1. wsrv.nl         ← global image cache, first choice on restricted networks
+ *   2. statically.io   ← independent image relay
+ *   3. /api/image      ← first-party API server proxy
+ *   4. image.tmdb.org  ← direct CDN, last resort only
  *
- * Each attempt gets 4s before stepping to the next.
+ * Each attempt gets 2.5s before stepping to the next.
  * expo-image's disk cache keeps successfully loaded images available across
  * app restarts and offline sessions.
  */
@@ -20,25 +21,43 @@ import { resolvePosterFallback } from "@/lib/posterFallback";
 
 // ─── Proxy hosts ──────────────────────────────────────────────────────────────
 const _API_HOST = API_HOST;
-const SERVER_PROXY: string | null = _API_HOST ? `${_API_HOST}/api/image?url=` : null;
+const _BROWSER_ORIGIN =
+  Platform.OS === "web" && typeof window !== "undefined"
+    ? window.location.origin
+    : null;
+const _IMAGE_PROXY_HOST = _API_HOST ?? _BROWSER_ORIGIN;
+const SERVER_PROXY: string | null = _IMAGE_PROXY_HOST
+  ? `${_IMAGE_PROXY_HOST.replace(/\/+$/, "")}/api/image?url=`
+  : null;
 
-function buildProxyUrl(directTmdbUrl: string, proxy: string, size: string): string {
-  const sized = directTmdbUrl.includes("/t/p/")
-    ? directTmdbUrl.replace(/\/t\/p\/[^/]+\//, `/t/p/${size}/`)
-    : directTmdbUrl;
-  return proxy ? `${proxy}${encodeURIComponent(sized)}` : sized;
-}
+function getTmdbImageDetails(directTmdbUrl: string): {
+  url: string;
+  size: string;
+  cleanPath: string;
+} | null {
+  try {
+    const parsed = new URL(directTmdbUrl);
+    if (parsed.hostname !== "image.tmdb.org") return null;
+    const match = parsed.pathname.match(/^\/t\/p\/([^/]+)\/(.+)$/);
+    if (!match?.[2]) return null;
 
-function getRequestedSize(directTmdbUrl: string): "w342" | "w500" | "w780" | "w1280" {
-  const match = directTmdbUrl.match(/\/t\/p\/(w342|w500|w780|w1280)\//);
-  if (match?.[1] === "w1280") return "w1280";
-  if (match?.[1] === "w780") return "w780";
-  if (match?.[1] === "w500") return "w500";
-  return "w342";
+    // Upgrade small card posters to the requested w500; preserve larger
+    // backdrop/detail sizes so their full-width artwork stays sharp.
+    const requestedSize = match[1];
+    const size = requestedSize === "w342" ? "w500" : requestedSize || "w500";
+    const cleanPath = match[2].replace(/^\/+/, "");
+    return {
+      url: `https://image.tmdb.org/t/p/${size}/${cleanPath}`,
+      size,
+      cleanPath,
+    };
+  } catch {
+    return null;
+  }
 }
 
 // Keep a stalled route from holding up the next available image source.
-const STEP_TIMEOUT_MS = 4_000;
+const STEP_TIMEOUT_MS = 2_500;
 
 // ─── URI normalisation ────────────────────────────────────────────────────────
 function extractDirectUrl(raw: string | undefined): string | undefined {
@@ -50,6 +69,18 @@ function extractDirectUrl(raw: string | undefined): string | undefined {
     if (m) {
       try { return decodeURIComponent(m[1]); } catch {}
     }
+    return raw;
+  }
+
+  // Statically relay URLs store the original host and path after /img/.
+  if (raw.includes("cdn.statically.io/img/")) {
+    try {
+      const parsed = new URL(raw);
+      const target = parsed.pathname.replace(/^\/img\//, "");
+      if (parsed.hostname === "cdn.statically.io" && target.startsWith("image.tmdb.org/")) {
+        return `https://${target}`;
+      }
+    } catch {}
     return raw;
   }
 
@@ -77,26 +108,23 @@ function extractDirectUrl(raw: string | undefined): string | undefined {
 function buildAttemptUrls(rawUri: string | undefined, directUrl: string | undefined): string[] {
   if (!directUrl) return rawUri ? [rawUri] : [];
 
-  const urls: string[] = [];
-  const isTmdb = directUrl.includes("image.tmdb.org");
-
-  if (isTmdb) {
-    // Use the first-party proxy where available, then fall back immediately to
-    // a third-party relay and the direct CDN. The latter two remain available
-    // even when this app has no API host configured.
-    if (SERVER_PROXY) {
-      urls.push(buildProxyUrl(directUrl, SERVER_PROXY, getRequestedSize(directUrl)));
-    }
-    urls.push(`https://wsrv.nl/?url=${encodeURIComponent(directUrl)}`);
-    urls.push(directUrl);
+  const tmdbImage = getTmdbImageDetails(directUrl);
+  if (tmdbImage) {
+    const encodedUrl = encodeURIComponent(tmdbImage.url);
+    const urls = [
+      `https://wsrv.nl/?url=${encodedUrl}&output=webp`,
+      `https://cdn.statically.io/img/image.tmdb.org/t/p/${tmdbImage.size}/${tmdbImage.cleanPath}`,
+    ];
+    if (SERVER_PROXY) urls.push(`${SERVER_PROXY}${encodedUrl}`);
+    urls.push(tmdbImage.url);
+    return [...new Set(urls)];
   }
 
-  // Preserve the original URL for non-TMDB assets. TMDB artwork must stay
-  // behind the first-party image proxy.
-  if (!isTmdb && (rawUri?.startsWith("http://") || rawUri?.startsWith("https://"))) {
-    urls.push(rawUri);
+  // Preserve the original URL for non-TMDB assets.
+  if (rawUri?.startsWith("http://") || rawUri?.startsWith("https://")) {
+    return [rawUri];
   }
-  return [...new Set(urls)];
+  return [directUrl];
 }
 
 // ─── Shimmer ──────────────────────────────────────────────────────────────────
@@ -311,7 +339,7 @@ const styles = StyleSheet.create({
 // ─── Prefetch utility ─────────────────────────────────────────────────────────
 /**
  * Prefetch a list of image URIs using the first SmartImage attempt.
- * Call after data loads to warm the Cloudflare edge cache before the user scrolls.
+ * Call after data loads to warm the first proxy cache before the user scrolls.
  */
 export async function prefetchImages(uris: (string | undefined | null)[]): Promise<void> {
   const valid = uris.filter(Boolean) as string[];

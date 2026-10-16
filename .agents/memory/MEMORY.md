@@ -1,2 +1,2 @@
 - [Protected source locks after imports](hero-source-locks.md) — Imported files can regain write permission; restore guard modes and keep intentional changes hash-verified.
-- [VPN-independent content region](vpn-region.md) — Device region should win over VPN-exposed IP location for regional catalogs.
+- [India poster delivery](india-poster-delivery.md) — Avoid relying on TMDB's direct image host for poster loads on Indian carrier networks.
