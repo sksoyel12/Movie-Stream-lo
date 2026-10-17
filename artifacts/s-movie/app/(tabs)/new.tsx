@@ -13,6 +13,7 @@ import {
   Text,
   View,
 } from "react-native";
+import Svg, { Text as SvgText } from "react-native-svg";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { haptic } from "@/lib/haptics";
@@ -21,16 +22,25 @@ import { tmdb, tmdbGet, tmdbImg, type TMDBMovie, type TMDBPage } from "@/lib/tmd
 import YoutubeEmbed from "@/components/YoutubeEmbed";
 import { detectContentRegion, getCurrentContentRegion } from "@/lib/region";
 import { useNetworkStatus } from "@/contexts/NetworkContext";
+import { useColors } from "@/hooks/useColors";
 
-const NEW_HOT_CACHE_KEY = "smovie_new_hot_v7";
+const NEW_HOT_CACHE_KEY = "smovie_new_hot_v8";
 const NEW_HOT_TOP10_CACHE_KEY = "smovie_new_hot_top10_v2_";
 const REMIND_KEY_PREFIX = "smovie_remind_v2_";
 const { width: SCREEN_W } = Dimensions.get("window");
-const BACKDROP_HEIGHT = Math.round((SCREEN_W - 28) * 9 / 16);
+const BACKDROP_HEIGHT = Math.round((SCREEN_W - 24) * 9 / 16);
+const TRENDING_FRESHNESS_DAYS = 365;
 const TODAY = (() => {
   const now = new Date();
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
     now.getDate(),
+  ).padStart(2, "0")}`;
+})();
+const TRENDING_CUTOFF = (() => {
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - TRENDING_FRESHNESS_DAYS);
+  return `${cutoff.getFullYear()}-${String(cutoff.getMonth() + 1).padStart(2, "0")}-${String(
+    cutoff.getDate(),
   ).padStart(2, "0")}`;
 })();
 
@@ -51,6 +61,49 @@ type FeedItem = {
   rank?: number;
 };
 
+type TMDBLogoResponse = {
+  logos?: Array<{
+    file_path: string;
+    iso_639_1?: string | null;
+    vote_average?: number;
+    vote_count?: number;
+  }>;
+};
+type TMDBLogo = NonNullable<TMDBLogoResponse["logos"]>[number];
+
+const titleLogoCache = new Map<string, string | null>();
+const titleLogoRequests = new Map<string, Promise<string | null>>();
+
+function fetchTitleLogo(mediaType: "movie" | "tv", tmdbId: number): Promise<string | null> {
+  const cacheKey = `${mediaType}:${tmdbId}`;
+  if (titleLogoCache.has(cacheKey)) return Promise.resolve(titleLogoCache.get(cacheKey) ?? null);
+  const inFlight = titleLogoRequests.get(cacheKey);
+  if (inFlight) return inFlight;
+
+  const request = tmdbGet<TMDBLogoResponse>(`/${mediaType}/${tmdbId}/images`, {
+    include_image_language: "en,null",
+  })
+    .then(({ logos = [] }) => {
+      const selected = [...logos]
+        .filter((logo) => logo.file_path?.startsWith("/"))
+        .sort((a, b) => {
+          const langPriority = (logo: TMDBLogo) =>
+            logo.iso_639_1 === "en" ? 0 : logo.iso_639_1 == null ? 1 : 2;
+          return langPriority(a) - langPriority(b) || (b.vote_count ?? 0) - (a.vote_count ?? 0);
+        })[0];
+      const uri = tmdbImg(selected?.file_path, "w500");
+      titleLogoCache.set(cacheKey, uri);
+      return uri;
+    })
+    .catch(() => {
+      titleLogoCache.set(cacheKey, null);
+      return null;
+    })
+    .finally(() => titleLogoRequests.delete(cacheKey));
+  titleLogoRequests.set(cacheKey, request);
+  return request;
+}
+
 function getFriendlyDate(date?: string): string {
   if (!date) return "Coming soon";
   const parsed = new Date(`${date}T12:00:00`);
@@ -59,6 +112,31 @@ function getFriendlyDate(date?: string): string {
     day: "numeric",
     month: "long",
   })}`;
+}
+
+function isRecentDate(date?: string): boolean {
+  return Boolean(
+    date &&
+      /^\d{4}-\d{2}-\d{2}$/.test(date) &&
+      date >= TRENDING_CUTOFF &&
+      date <= TODAY,
+  );
+}
+
+function isRecentTrendingItem(item: TMDBMovie): boolean {
+  const schedule = item as TMDBMovie & {
+    next_episode_to_air?: { air_date?: string | null } | null;
+  };
+  const mediaType = item.media_type === "tv" ? "tv" : "movie";
+  const date =
+    mediaType === "tv"
+      ? schedule.next_episode_to_air?.air_date ?? item.first_air_date
+      : item.release_date ?? item.first_air_date;
+  return isRecentDate(date);
+}
+
+function keepRecentTrendingItems(items: FeedItem[]): FeedItem[] {
+  return items.filter((item) => isRecentDate(item.nextEpisodeDate ?? item.releaseDate));
 }
 
 function isFutureDate(date?: string): boolean {
@@ -139,26 +217,40 @@ function uniqueFeed(
 function ChipHeader({
   activeFilter,
   onChange,
+  onBack,
   topInset,
   isOffline,
   showCachedNotice,
 }: {
   activeFilter: Filter;
   onChange: (filter: Filter) => void;
+  onBack: () => void;
   topInset: number;
   isOffline: boolean;
   showCachedNotice: boolean;
 }) {
-  const filters: Array<{ value: Filter; label: string; badge?: boolean }> = [
-    { value: "comingSoon", label: "🍿 Coming Soon" },
-    { value: "everyonesWatching", label: "🔥 Everyone's Watching" },
-    { value: "halloween", label: "🎃 Halloween" },
+  const colors = useColors();
+  const filters: Array<{ value: Filter; label: string; emoji?: string; badge?: boolean }> = [
+    { value: "comingSoon", emoji: "🍿", label: "Coming Soon" },
+    { value: "everyonesWatching", emoji: "🔥", label: "Everyone's Watching" },
+    { value: "halloween", emoji: "🎃", label: "Halloween" },
     { value: "top10Shows", label: "Top 10 Shows", badge: true },
     { value: "top10Movies", label: "Top 10 Movies", badge: true },
   ];
   return (
     <View style={[styles.stickyHeader, { paddingTop: topInset + 12 }]}>
-      <Text style={styles.pageTitle}>New &amp; Hot</Text>
+      <View style={styles.titleRow}>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Go back"
+          onPress={onBack}
+          hitSlop={10}
+          style={styles.backButton}
+        >
+          <Ionicons name="arrow-back" size={22} color={colors.text} />
+        </Pressable>
+        <Text style={[styles.pageTitle, { color: colors.text }]}>New &amp; Hot</Text>
+      </View>
       <ScrollView
         horizontal
         showsHorizontalScrollIndicator={false}
@@ -178,14 +270,18 @@ function ChipHeader({
               activeFilter === filter.value && styles.filterChipActive,
             ]}
           >
+            {filter.emoji ? (
+              <Text style={styles.filterChipEmoji}>{filter.emoji}</Text>
+            ) : null}
             {filter.badge ? (
-              <View style={styles.filterChipBadge}>
+              <View style={[styles.filterChipBadge, { backgroundColor: colors.primary }]}>
                 <Text style={styles.filterChipBadgeText}>TOP 10</Text>
               </View>
             ) : null}
             <Text
               style={[
                 styles.filterChipText,
+                { color: activeFilter === filter.value ? colors.background : colors.text },
                 activeFilter === filter.value && styles.filterChipTextActive,
               ]}
             >
@@ -194,7 +290,7 @@ function ChipHeader({
           </Pressable>
         ))}
       </ScrollView>
-      {showCachedNotice && (
+      {showCachedNotice && isOffline && (
         <View style={styles.cacheNotice}>
           <Ionicons name="cloud-offline-outline" size={14} color="#FBBF24" />
           <Text style={styles.cacheNoticeText}>
@@ -210,7 +306,7 @@ function ChipHeader({
 
 function LoadingCard() {
   return (
-    <View style={styles.card}>
+    <View style={styles.loadingCard}>
       <View style={[styles.skeleton, styles.skeletonImage]} />
       <View style={[styles.skeleton, styles.skeletonTitle]} />
       <View style={[styles.skeleton, styles.skeletonLine]} />
@@ -228,6 +324,7 @@ function FeedCard({
   inMyList,
   onToggleMyList,
   previewActive,
+  logoActive,
   onPreviewChange,
 }: {
   item: FeedItem;
@@ -237,11 +334,25 @@ function FeedCard({
   inMyList: boolean;
   onToggleMyList: (item: FeedItem) => void;
   previewActive: boolean;
+  logoActive: boolean;
   onPreviewChange: (id: string | null) => void;
 }) {
+  const colors = useColors();
   const [trailerKey, setTrailerKey] = useState<string | null>(null);
   const [trailerFailed, setTrailerFailed] = useState(false);
   const [muted, setMuted] = useState(true);
+  const [titleLogoUri, setTitleLogoUri] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!logoActive) return;
+    let active = true;
+    void fetchTitleLogo(item.mediaType, item.tmdbId).then((uri) => {
+      if (active && uri) setTitleLogoUri(uri);
+    });
+    return () => {
+      active = false;
+    };
+  }, [item.mediaType, item.tmdbId, logoActive]);
 
   useEffect(() => {
     if (!previewActive || trailerKey || trailerFailed) return;
@@ -280,7 +391,24 @@ function FeedCard({
     (!item.releaseDate || isFutureDate(item.releaseDate));
 
   return (
-    <View style={styles.card}>
+    <View style={[styles.card, item.rank != null && styles.rankedCard]}>
+      {item.rank != null ? (
+        <Svg width={152} height={110} viewBox="0 0 152 110" style={styles.rankWatermark}>
+          <SvgText
+            x="0"
+            y="96"
+            fill="#050505"
+            stroke="#fff"
+            strokeWidth={1.5}
+            fontSize="98"
+            fontWeight="900"
+            letterSpacing="-4"
+          >
+            {String(item.rank).padStart(2, "0")}
+          </SvgText>
+        </Svg>
+      ) : null}
+      <View style={styles.cardFrame}>
       <View style={styles.backdropWrap}>
         {previewActive && trailerKey ? (
           <YoutubeEmbed
@@ -307,39 +435,31 @@ function FeedCard({
           />
         )}
         <View style={styles.ageBadge}>
-          <Text style={styles.ageBadgeText}>{item.rating}</Text>
+          <Text style={[styles.ageBadgeText, { color: colors.text }]}>{item.rating}</Text>
         </View>
-        {item.rank ? (
-          <Text style={styles.rankWatermark}>
-            {String(item.rank).padStart(2, "0")}
-          </Text>
-        ) : null}
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel={
-            item.rank
-              ? `Open ${item.title}`
-              : previewActive
+        {!(previewActive && trailerKey) ? (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={
+              previewActive
                 ? `Pause preview for ${item.title}`
                 : `Play preview for ${item.title}`
-          }
-          onPress={() => {
-            haptic.light();
-            if (item.rank) openDetails();
-            else onPreviewChange(previewActive ? null : item.id);
-          }}
-          style={styles.previewButton}
-        >
-          <Ionicons
-            name={previewActive ? "pause" : "play"}
-            size={24}
-            color="#fff"
-          />
-        </Pressable>
-        <View style={styles.brandWatermark}>
-          <Text style={styles.brandLogo}>S</Text>
-          <Text style={styles.brandLabel}>S-MOVIE</Text>
-        </View>
+            }
+            onPress={() => {
+              haptic.light();
+              onPreviewChange(previewActive ? null : item.id);
+            }}
+            style={styles.previewButton}
+          >
+            <Ionicons name={previewActive ? "pause" : "play"} size={24} color={colors.text} />
+          </Pressable>
+        ) : null}
+        {item.rank == null ? (
+          <View style={styles.brandWatermark}>
+            <Text style={[styles.brandLogo, { color: colors.primary }]}>S</Text>
+            <Text style={[styles.brandLabel, { color: colors.text }]}>S-MOVIE</Text>
+          </View>
+        ) : null}
         {previewActive && trailerKey ? (
           <Pressable
             accessibilityRole="button"
@@ -360,12 +480,32 @@ function FeedCard({
       </View>
 
       <View style={styles.cardContent}>
-        <Pressable accessibilityRole="button" onPress={openDetails}>
-          <Text style={styles.title} numberOfLines={2}>{item.title}</Text>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={`Open ${item.title}`}
+          onPress={openDetails}
+          style={styles.titleLogoSlot}
+        >
+          {titleLogoUri ? (
+            <SmartImage
+              source={{ uri: titleLogoUri }}
+              style={styles.titleLogo}
+              contentFit="contain"
+              transition={180}
+              cachePolicy="disk"
+              title={`${item.title} title logo`}
+            />
+          ) : (
+            <Text style={[styles.title, { color: colors.text }]} numberOfLines={2}>
+              {item.title}
+            </Text>
+          )}
         </Pressable>
-        <Text style={styles.schedule}>{releaseLabel}</Text>
-        <Text style={styles.overview} numberOfLines={3}>{item.overview}</Text>
-        <View style={styles.cardActions}>
+        <Text style={[styles.schedule, { color: colors.text }]}>{releaseLabel}</Text>
+        <Text style={[styles.overview, { color: colors.mutedForeground }]} numberOfLines={4}>
+          {item.overview}
+        </Text>
+              <View style={styles.cardActions}>
           {showReminder ? (
             <Pressable
               accessibilityRole="button"
@@ -380,9 +520,9 @@ function FeedCard({
               <Ionicons
                 name={reminded ? "checkmark" : "notifications-outline"}
                 size={18}
-                color="#fff"
+                color={colors.background}
               />
-              <Text style={styles.remindButtonText}>
+              <Text style={[styles.remindButtonText, { color: colors.background }]}>
                 {reminded ? "Reminded" : "Remind Me"}
               </Text>
             </Pressable>
@@ -394,7 +534,7 @@ function FeedCard({
                 onPress={openDetails}
                 style={({ pressed }) => [styles.playButton, pressed && { opacity: 0.82 }]}
               >
-                <Ionicons name="play" size={17} color="#000" />
+                <Ionicons name="play" size={17} color={colors.background} />
                 <Text style={styles.playButtonText}>Play</Text>
               </Pressable>
               <Pressable
@@ -403,7 +543,11 @@ function FeedCard({
                 onPress={() => onToggleMyList(item)}
                 style={({ pressed }) => [styles.myListButton, pressed && { opacity: 0.82 }]}
               >
-                <Ionicons name={inMyList ? "checkmark" : "add"} size={19} color="#fff" />
+                <Ionicons
+                  name={inMyList ? "checkmark" : "add"}
+                  size={19}
+                  color={colors.text}
+                />
                 <Text style={styles.myListButtonText}>
                   {inMyList ? "In My List" : "My List"}
                 </Text>
@@ -413,10 +557,12 @@ function FeedCard({
         </View>
       </View>
     </View>
+    </View>
   );
 }
 
 export default function NewAndHotScreen() {
+  const colors = useColors();
   const insets = useSafeAreaInsets();
   const { isOffline } = useNetworkStatus();
   const { isInList, toggle: toggleMyList } = useMyList();
@@ -444,7 +590,7 @@ export default function NewAndHotScreen() {
       viewableItems: Array<{ isViewable: boolean; item: FeedItem | null }>;
     }) => {
       const visiblePreview = viewableItems.find(
-        (token) => token.isViewable && token.item && !token.item.rank,
+        (token) => token.isViewable && token.item,
       )?.item;
       setActivePreviewId(visiblePreview?.id ?? null);
     },
@@ -477,12 +623,14 @@ export default function NewAndHotScreen() {
       const [
         upcomingMoviesResult,
         onAirShowsResult,
-        trendingResult,
+        trendingPageOneResult,
+        trendingPageTwoResult,
         halloweenResult,
       ] = await Promise.allSettled([
         tmdbGet<TMDBPage>("/movie/upcoming", { page: 1, region: region.code }),
         tmdbGet<TMDBPage>("/tv/on_the_air", { page: 1, region: region.code }),
         tmdbGet<TMDBPage>("/trending/all/week", { page: 1, region: region.code }),
+        tmdbGet<TMDBPage>("/trending/all/week", { page: 2, region: region.code }),
         tmdbGet<TMDBPage>("/discover/movie", {
           with_genres: "27,53",
           sort_by: "popularity.desc",
@@ -507,9 +655,12 @@ export default function NewAndHotScreen() {
                 : []),
             ])
           : null;
+      const successfulTrendPages = [trendingPageOneResult, trendingPageTwoResult]
+        .filter((result): result is PromiseFulfilledResult<TMDBPage> => result.status === "fulfilled")
+        .flatMap((result) => result.value.results ?? []);
       const trending =
-        trendingResult.status === "fulfilled"
-          ? uniqueFeed(trendingResult.value.results ?? [])
+        successfulTrendPages.length > 0
+          ? uniqueFeed(successfulTrendPages.filter(isRecentTrendingItem))
           : null;
       const spooky =
         halloweenResult.status === "fulfilled"
@@ -568,7 +719,7 @@ export default function NewAndHotScreen() {
         // Stale data is still useful when the device is offline. The network
         // request below revalidates it when possible.
         const cachedComing = cachedItems(cached.comingSoon);
-        const cachedTrending = cachedItems(cached.everyonesWatching);
+        const cachedTrending = keepRecentTrendingItems(cachedItems(cached.everyonesWatching));
         const cachedHalloween = cachedItems(cached.halloween);
         if (cachedComing.length) setComingSoon(cachedComing);
         if (cachedTrending.length) setEveryonesWatching(cachedTrending);
@@ -696,7 +847,7 @@ export default function NewAndHotScreen() {
       : items;
 
   return (
-    <View style={styles.container}>
+    <View style={[styles.container, { backgroundColor: colors.background }]}>
       <FlatList
         data={data}
         keyExtractor={(item, index) => item?.id ?? `skeleton-${index}`}
@@ -712,7 +863,8 @@ export default function NewAndHotScreen() {
               activeFilter={activeFilter}
               inMyList={isInList(item.id)}
               onToggleMyList={handleToggleMyList}
-              previewActive={item.id === activePreviewId && !item.rank}
+              previewActive={item.id === activePreviewId}
+              logoActive={item.id === activePreviewId}
               onPreviewChange={setActivePreviewId}
             />
           ) : <LoadingCard />
@@ -724,6 +876,11 @@ export default function NewAndHotScreen() {
               setActivePreviewId(null);
               setError(null);
               setActiveFilter(filter);
+            }}
+            onBack={() => {
+              haptic.light();
+              if (router.canGoBack()) router.back();
+              else router.replace("/");
             }}
             topInset={topInset}
             isOffline={isOffline}
@@ -774,15 +931,22 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#000" },
   stickyHeader: {
     backgroundColor: "#000",
-    paddingHorizontal: 14,
-    paddingBottom: 12,
+    paddingHorizontal: 10,
+    paddingBottom: 10,
   },
+  titleRow: {
+    minHeight: 42,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 14,
+    marginBottom: 12,
+  },
+  backButton: { width: 28, height: 38, justifyContent: "center" },
   pageTitle: {
     color: "#fff",
-    fontSize: 24,
-    fontFamily: "Inter_700Bold",
-    letterSpacing: -0.5,
-    marginBottom: 12,
+    fontSize: 22,
+    fontFamily: "Inter_600SemiBold",
+    letterSpacing: -0.6,
   },
   chipsContent: { gap: 8, paddingRight: 16 },
   cacheNotice: {
@@ -803,10 +967,10 @@ const styles = StyleSheet.create({
     alignItems: "center",
     backgroundColor: "#1C1C1E",
     borderRadius: 24,
-    paddingHorizontal: 15,
-    paddingVertical: 9,
+    paddingHorizontal: 13,
+    paddingVertical: 7,
     borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.12)",
+    borderColor: "rgba(255,255,255,0.42)",
   },
   filterChipActive: { backgroundColor: "#fff", borderColor: "#fff" },
   filterChipBadge: {
@@ -826,12 +990,28 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontFamily: "Inter_600SemiBold",
   },
+  filterChipEmoji: { fontSize: 16, lineHeight: 18 },
   filterChipTextActive: { color: "#000", fontFamily: "Inter_700Bold" },
-  feedContent: { paddingTop: 10, paddingHorizontal: 14 },
+  feedContent: { paddingTop: 8, paddingHorizontal: 12 },
   card: {
+    position: "relative",
+    overflow: "visible",
+    marginBottom: 18,
+  },
+  rankedCard: { marginTop: 58 },
+  cardFrame: {
+    position: "relative",
+    zIndex: 1,
     overflow: "hidden",
     backgroundColor: "#050505",
-    borderRadius: 8,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#292929",
+  },
+  loadingCard: {
+    overflow: "hidden",
+    backgroundColor: "#050505",
+    borderRadius: 12,
     marginBottom: 18,
     borderWidth: 1,
     borderColor: "#292929",
@@ -841,7 +1021,7 @@ const styles = StyleSheet.create({
     height: BACKDROP_HEIGHT,
     backgroundColor: "#222",
     position: "relative",
-    borderRadius: 8,
+    borderRadius: 14,
     overflow: "hidden",
   },
   backdrop: { width: "100%", height: "100%" },
@@ -912,87 +1092,91 @@ const styles = StyleSheet.create({
   },
   rankWatermark: {
     position: "absolute",
-    left: 12,
-    bottom: -7,
-    color: "rgba(255,255,255,0.66)",
-    fontSize: 64,
-    lineHeight: 70,
-    fontFamily: "Inter_800ExtraBold",
-    textShadowColor: "rgba(0,0,0,0.75)",
-    textShadowOffset: { width: 1, height: 2 },
-    textShadowRadius: 4,
+    left: 10,
+    top: -64,
+    zIndex: 0,
   },
   ageBadgeText: {
     color: "#fff",
     fontSize: 10,
     fontFamily: "Inter_600SemiBold",
   },
-  cardContent: { padding: 15 },
+  cardContent: { padding: 13 },
+  titleLogoSlot: {
+    minHeight: 54,
+    justifyContent: "flex-start",
+    marginBottom: 2,
+  },
+  titleLogo: {
+    width: "100%",
+    height: 50,
+    alignSelf: "flex-start",
+  },
   title: {
     color: "#fff",
-    fontSize: 20,
-    lineHeight: 26,
-    fontFamily: "Inter_800ExtraBold",
+    fontSize: 16,
+    lineHeight: 22,
+    fontFamily: "Inter_700Bold",
   },
   schedule: {
     color: "#bdbdbd",
-    fontSize: 13,
+    fontSize: 14,
+    lineHeight: 21,
     fontFamily: "Inter_600SemiBold",
-    marginTop: 6,
+    marginTop: 5,
   },
   overview: {
     color: "#999999",
     fontSize: 13,
-    lineHeight: 20,
+    lineHeight: 21,
     fontFamily: "Inter_400Regular",
-    marginTop: 9,
+    marginTop: 8,
   },
-  cardActions: { flexDirection: "row", alignItems: "center", gap: 10 },
+  cardActions: { flexDirection: "row", alignItems: "center", gap: 6 },
   remindButton: {
-    flex: 1,
-    minHeight: 48,
+    width: 150,
+    minHeight: 54,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
     gap: 8,
-    backgroundColor: "#262626",
-    borderRadius: 24,
+    backgroundColor: "#fff",
+    borderRadius: 6,
     paddingHorizontal: 16,
-    marginTop: 15,
+    marginTop: 12,
   },
   remindButtonActive: {
-    backgroundColor: "#262626",
     borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.18)",
+    borderColor: "#fff",
   },
   remindButtonText: {
-    color: "#fff",
-    fontSize: 14,
-    fontFamily: "Inter_700Bold",
+    color: "#000",
+    fontSize: 15,
+    fontFamily: "Inter_600SemiBold",
   },
   playButton: {
-    flex: 1,
-    minHeight: 48,
+    width: 96,
+    minHeight: 54,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
     gap: 8,
-    marginTop: 15,
+    marginTop: 12,
     paddingHorizontal: 16,
-    borderRadius: 8,
+    borderRadius: 6,
     backgroundColor: "#fff",
   },
   playButtonText: { color: "#000", fontSize: 14, fontFamily: "Inter_700Bold" },
   myListButton: {
-    flex: 1,
-    minHeight: 48,
+    width: 119,
+    minHeight: 54,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
     gap: 8,
-    marginTop: 15,
+    marginTop: 12,
     paddingHorizontal: 12,
-    borderRadius: 8,
+    borderRadius: 6,
     backgroundColor: "#262626",
   },
   myListButtonText: { color: "#fff", fontSize: 14, fontFamily: "Inter_700Bold" },

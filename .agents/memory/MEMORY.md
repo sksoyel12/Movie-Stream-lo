@@ -1,2 +1,3 @@
 - [Protected source locks after imports](hero-source-locks.md) — Imported files can regain write permission; restore guard modes and keep intentional changes hash-verified.
 - [India poster delivery](india-poster-delivery.md) — Avoid relying on TMDB's direct image host for poster loads on Indian carrier networks.
+- [New & Hot screenshot density](new-hot-density.md) — Keep card typography, spacing, and buttons close to the user's supplied Android references.
